@@ -17,6 +17,8 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as mpatches
 import matplotlib as mpl
 
+from autoregressive_nano_tabpfn.model.attention import create_row_mask, create_dense_mask
+
 
 def visualize_row_mask(
     context_len: int,

@@ -15,6 +15,7 @@ from .attention import (
     clear_mask_cache,
 )
 from .triton_kernels import triton_available, cross_attention
+from .inference import ARTabPFNPredictor
 
 __all__ = [
     # Model
@@ -23,6 +24,8 @@ __all__ = [
     "TwoStageTransformer",
     "TwoStageTransformerLayer",
     "MixtureGaussianHead",
+    # Inference
+    "ARTabPFNPredictor",
     # Attention
     "MultiheadAttention",
     "create_dense_mask",

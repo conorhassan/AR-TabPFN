@@ -141,15 +141,10 @@ def create_row_mask(
 
             return base_condition & in_attending_region & causal
 
-        def diag_mask(b, h, q_idx, kv_idx):
-            """Self-attention on diagonal."""
-            return q_idx == kv_idx
-
-        # Combine all masks
+        # Combine all masks (no diagonal self-attention for targets, matching nanoTabPFN)
         final_mask_mod = or_masks(
             prefix_mask,
             localized_causal_ctx_buf,
-            diag_mask,
             chunked_target_buffer,
         )
         final_mask_mod.__name__ = f"row_mask_{num_rows}_{context_len}_{buffer_len}"
