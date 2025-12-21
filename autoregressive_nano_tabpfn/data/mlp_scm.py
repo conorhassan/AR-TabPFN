@@ -1,8 +1,7 @@
 """
 MLP-based Structural Causal Model (SCM) for synthetic tabular data generation.
 
-Vendored and adapted from TabICL (https://github.com/soda-inria/tabicl).
-Generates synthetic regression datasets with controllable causal structure.
+Based on TabICL: https://github.com/soda-inria/tabicl
 """
 
 from __future__ import annotations
@@ -27,9 +26,7 @@ class GaussianNoise(nn.Module):
             self.std = std
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.training or True:  # Always add noise during generation
-            return x + torch.randn_like(x) * self.std
-        return x
+        return x + torch.randn_like(x) * self.std
 
 
 class XSampler:
@@ -49,67 +46,91 @@ class XSampler:
         self.sampling = sampling
         self.device = device
 
-        # Pre-sample statistics if requested
-        if pre_stats and sampling == "normal":
-            self.means = torch.randn(num_causes, device=device)
-            self.stds = torch.abs(torch.randn(num_causes, device=device)) + 0.1
+        if pre_stats:
+            self._pre_stats()
         else:
             self.means = None
             self.stds = None
 
+    def _pre_stats(self):
+        """Pre-sample mean and std for normal distributions."""
+        means = np.random.normal(0, 1, self.num_causes)
+        stds = np.abs(np.random.normal(0, 1, self.num_causes) * means)
+        self.means = (
+            torch.tensor(means, dtype=torch.float, device=self.device)
+            .unsqueeze(0)
+            .repeat(self.seq_len, 1)
+        )
+        self.stds = (
+            torch.tensor(stds, dtype=torch.float, device=self.device)
+            .unsqueeze(0)
+            .repeat(self.seq_len, 1)
+        )
+
     def sample(self) -> torch.Tensor:
         """Sample cause variables. Returns (seq_len, num_causes)."""
         if self.sampling == "normal":
-            if self.means is not None:
-                x = torch.randn(self.seq_len, self.num_causes, device=self.device)
-                x = x * self.stds + self.means
-            else:
-                x = torch.randn(self.seq_len, self.num_causes, device=self.device)
-
+            return self._sample_normal_all()
         elif self.sampling == "uniform":
-            x = torch.rand(self.seq_len, self.num_causes, device=self.device)
-
+            return torch.rand(self.seq_len, self.num_causes, device=self.device)
         elif self.sampling == "mixed":
-            x = self._sample_mixed()
-
+            return self._sample_mixed()
         else:
             raise ValueError(f"Unknown sampling method: {self.sampling}")
 
-        return x
+    def _sample_normal_all(self) -> torch.Tensor:
+        """Sample all features from normal distribution."""
+        if self.means is not None:
+            return torch.normal(self.means, self.stds.abs()).float()
+        else:
+            return torch.normal(
+                0.0, 1.0, (self.seq_len, self.num_causes), device=self.device
+            ).float()
+
+    def _sample_normal(self, n: int) -> torch.Tensor:
+        """Sample single feature from normal distribution."""
+        if self.means is not None:
+            return torch.normal(self.means[:, n], self.stds[:, n].abs()).float()
+        else:
+            return torch.normal(0.0, 1.0, (self.seq_len,), device=self.device).float()
+
+    def _sample_multinomial(self) -> torch.Tensor:
+        """Sample from weighted multinomial distribution."""
+        n_categories = random.randint(2, 20)
+        probs = torch.rand(n_categories, device=self.device)
+        x = torch.multinomial(probs, self.seq_len, replacement=True)
+        x = x.float()
+        return (x - x.mean()) / x.std()
+
+    def _sample_zipf(self) -> torch.Tensor:
+        """Sample from Zipf distribution (centered, not scaled)."""
+        x = np.random.zipf(2.0 + random.random() * 2, (self.seq_len,))
+        x = torch.tensor(x, device=self.device).clamp(max=10)
+        x = x.float()
+        return x - x.mean()
 
     def _sample_mixed(self) -> torch.Tensor:
-        """Sample using a mixture of distributions."""
-        x = torch.zeros(self.seq_len, self.num_causes, device=self.device)
+        """Sample using probability-based mixture of distributions.
 
-        for i in range(self.num_causes):
-            dist_type = random.choice(["normal", "uniform", "categorical", "zipf"])
+        Uses conditional probability logic that biases toward normal (~67%).
+        """
+        X = []
+        zipf_p = random.random() * 0.66
+        multi_p = random.random() * 0.66
+        normal_p = random.random() * 0.66
 
-            if dist_type == "normal":
-                mean = random.uniform(-2, 2)
-                std = random.uniform(0.5, 2.0)
-                x[:, i] = torch.randn(self.seq_len, device=self.device) * std + mean
+        for n in range(self.num_causes):
+            if random.random() > normal_p:
+                x = self._sample_normal(n)
+            elif random.random() > multi_p:
+                x = self._sample_multinomial()
+            elif random.random() > zipf_p:
+                x = self._sample_zipf()
+            else:
+                x = torch.rand((self.seq_len,), device=self.device)
+            X.append(x)
 
-            elif dist_type == "uniform":
-                low = random.uniform(-3, 0)
-                high = random.uniform(0, 3)
-                x[:, i] = (
-                    torch.rand(self.seq_len, device=self.device) * (high - low) + low
-                )
-
-            elif dist_type == "categorical":
-                n_cats = random.randint(2, 10)
-                cats = torch.randint(0, n_cats, (self.seq_len,), device=self.device)
-                x[:, i] = cats.float() / (n_cats - 1) * 2 - 1  # Normalize to [-1, 1]
-
-            elif dist_type == "zipf":
-                # Approximate Zipf using numpy then convert
-                a = random.uniform(1.5, 3.0)
-                vals = np.random.zipf(a, self.seq_len).astype(np.float32)
-                vals = np.clip(vals, 1, 100)  # Clip extreme values
-                vals = (vals - vals.mean()) / (vals.std() + 1e-6)  # Normalize
-                x[:, i] = torch.from_numpy(vals).to(self.device)
-
-        return x
+        return torch.stack(X, -1)
 
 
 class MLPSCM(nn.Module):
@@ -228,7 +249,7 @@ class MLPSCM(nn.Module):
     def _init_block_dropout(self, param: torch.Tensor):
         """Block-wise sparse initialization."""
         nn.init.zeros_(param)
-        n_blocks = random.randint(1, max(1, int(math.sqrt(min(param.shape)))))
+        n_blocks = random.randint(1, math.ceil(math.sqrt(min(param.shape))))
         block_size = [dim // n_blocks for dim in param.shape]
         if block_size[0] == 0 or block_size[1] == 0:
             nn.init.normal_(param, std=self.init_std)
@@ -295,10 +316,10 @@ class MLPSCM(nn.Module):
         total_dim = outputs_flat.shape[-1]
 
         if self.in_clique:
-            # Contiguous block sampling
+            # Block sampling with random permutation within block
             max_start = total_dim - self.num_outputs - self.num_features
             start = random.randint(0, max(0, max_start))
-            perm = start + torch.arange(
+            perm = start + torch.randperm(
                 self.num_outputs + self.num_features, device=self.device
             )
         else:

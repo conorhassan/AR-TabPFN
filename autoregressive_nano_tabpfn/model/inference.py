@@ -76,7 +76,6 @@ class ARTabPFNPredictor:
             backend=backend,
         )
 
-    # Cache management
     def init_kv_cache(
         self,
         batch_size: int,
@@ -220,7 +219,6 @@ class ARTabPFNPredictor:
         self.seq_len = Nc
         self._prefill_batch_size = B_full  # Remember original batch size
 
-    # Autoregressive decoding
     @torch.no_grad()
     def transformer_decode(self, embedding: Tensor, commit: int) -> Tensor:
         """
@@ -318,7 +316,6 @@ class ARTabPFNPredictor:
 
         return y_pred[:, :, 0, 0]  # [B, 1]
 
-    # User-level functions
     @torch.no_grad()
     def sample_sequence(
         self,
@@ -487,7 +484,6 @@ class ARTabPFNPredictor:
 
         return self.backbone.norm(x.squeeze(2))
 
-    # Internal helpers
     def _create_causal_mask(self, seq_len: int, device: torch.device) -> BlockMask:
         """Create causal self-attention mask for prefill."""
 

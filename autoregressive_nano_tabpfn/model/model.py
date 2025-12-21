@@ -262,7 +262,6 @@ class MixtureGaussianHead(nn.Module):
         sel_mean = torch.gather(mean_flat, 1, indices).view(B, T, D, num_samples)
         sel_std = torch.gather(std_flat, 1, indices).view(B, T, D, num_samples)
 
-        # Sample from Gaussians
         samples = sel_mean + sel_std * torch.randn_like(sel_mean)
         return samples.permute(0, 1, 3, 2)  # [B, T, num_samples, D]
 

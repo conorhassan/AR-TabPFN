@@ -529,11 +529,6 @@ def triton_available() -> bool:
     return HAS_TRITON
 
 
-# =============================================================================
-# PyTorch Reference Implementations (for testing and fallback)
-# =============================================================================
-
-
 def pytorch_context_attention(
     q: Tensor, k_ctx: Tensor, v_ctx: Tensor, scale: Optional[float] = None
 ) -> Tuple[Tensor, Tensor]:
@@ -760,19 +755,10 @@ def hybrid_attention(
     return out
 
 
-# =============================================================================
-# Legacy API (for backwards compatibility)
-# =============================================================================
-
-
 def cross_attention(
     q: Tensor, k_ctx: Tensor, v_ctx: Tensor, use_triton: bool = True
 ) -> Tensor:
-    """
-    Legacy cross-attention interface (without LSE output).
-
-    For new code, use triton_context_attention or hybrid_attention instead.
-    """
+    """Cross-attention without LSE output. Prefer hybrid_attention for new code."""
     if use_triton and HAS_TRITON and q.is_cuda:
         out, _ = triton_context_attention(q, k_ctx, v_ctx)
         return out
