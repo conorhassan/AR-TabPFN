@@ -16,7 +16,11 @@ from torch.nn.attention.flex_attention import (
 )
 
 from .attention import create_dense_mask
-from .triton_kernels import hybrid_attention, triton_available
+from .triton_kernels import (
+    hybrid_attention,
+    hybrid_teacher_forcing_attention,
+    triton_available,
+)
 
 if torch.cuda.is_available():
     try:
@@ -376,22 +380,44 @@ class ARTabPFNPredictor:
             log_density: [B, Nt] log-density of each y_target under the model
         """
         if self.backend == "triton":
-            warnings.warn(
-                "Triton backend does not support teacher forcing; falling back to flex_attention.",
-                RuntimeWarning,
+            return self._evaluate_joint_density_triton(
+                x_context, y_context, x_target, y_target
             )
-            original_backend = self.backend
-            self.backend = "flex_attention"
-            try:
-                return self._evaluate_joint_density_flex(
-                    x_context, y_context, x_target, y_target
-                )
-            finally:
-                self.backend = original_backend
 
         return self._evaluate_joint_density_flex(
             x_context, y_context, x_target, y_target
         )
+
+    @torch.no_grad()
+    def _evaluate_joint_density_triton(
+        self,
+        x_context: Tensor,
+        y_context: Tensor,
+        x_target: Tensor,
+        y_target: Tensor,
+    ) -> Tensor:
+        B, Nc, _ = x_context.shape
+        Nt = x_target.shape[1]
+        device, dtype = x_context.device, x_context.dtype
+
+        self.init_kv_cache(B, Nt, device, dtype)
+        self.prefill_context(x_context, y_context)
+
+        # Embed all buffers from (x_target, y_target) with AR position embeddings
+        buffer_emb = self.embedder.embed_buffer(x_target, y_target)
+        ar_positions = torch.arange(Nt, device=device) % self.ar_tokens.shape[0]
+        buffer_emb = buffer_emb + self.ar_tokens[ar_positions]
+
+        # Embed all targets
+        target_emb = self.embedder.embed_target(x_target)
+
+        # [Buffer_0..Nt-1, Target_0..Nt-1]
+        embedding = torch.cat([buffer_emb, target_emb], dim=1)
+
+        z = self._teacher_forcing_decode_triton(embedding, Nt)
+
+        z_targets = z[:, Nt:, :]
+        return self.head.log_likelihood(z_targets, y_target.unsqueeze(-1))
 
     @torch.no_grad()
     def _evaluate_joint_density_flex(
@@ -440,6 +466,23 @@ class ARTabPFNPredictor:
         for layer in self.backbone.layers:
             x = self._layer_decode_with_cache(
                 layer, x, feature_mask, row_mask, cache_start=self.seq_len
+            )
+
+        return self.backbone.norm(x.squeeze(2))
+
+    @torch.no_grad()
+    def _teacher_forcing_decode_triton(
+        self, embedding: Tensor, num_targets: int
+    ) -> Tensor:
+        """Process [buffers, targets] with Triton context attention + buffer SDPA."""
+        B, N, D = embedding.shape
+        x = embedding.unsqueeze(2)
+
+        feature_mask = create_dense_mask(seq_len=1, device=x.device)
+
+        for layer in self.backbone.layers:
+            x = self._layer_teacher_forcing_triton(
+                layer, x, feature_mask, num_targets
             )
 
         return self.backbone.norm(x.squeeze(2))
@@ -779,6 +822,63 @@ class ARTabPFNPredictor:
             ] = v_new_buf
 
             attn_out = torch.cat([out_buf, out_tgt], dim=2)
+
+        attn_out = attn_out.transpose(1, 2).reshape(B, N, D)
+        attn_out = layer.attn_rows.out_proj(attn_out)
+
+        x_row = layer.norm2(x_row + attn_out)
+
+        # FFN
+        x_out = layer.norm3(x_row + layer.ff(x_row))
+
+        return x_out.unsqueeze(2)  # [B, N, 1, D]
+
+    def _layer_teacher_forcing_triton(
+        self,
+        layer,
+        x: Tensor,
+        feature_mask: BlockMask,
+        num_targets: int,
+    ) -> Tensor:
+        """
+        Decode through one layer using shared-context attention for teacher forcing.
+
+        Args:
+            layer: TwoStageTransformerLayer
+            x: [B, N, C, D] new tokens (C=1), N must be 2*num_targets
+            feature_mask: Mask for feature attention
+            num_targets: Number of target tokens (Nt)
+
+        Returns:
+            [B, N, C, D] output
+        """
+        B, N, C, D = x.shape
+        if N != 2 * num_targets:
+            raise ValueError("Expected N == 2*num_targets for teacher forcing.")
+
+        # Feature attention
+        x_feat = x.reshape(B * N, C, D)
+        attn_out, _ = layer.attn_features(x_feat, x_feat, x_feat, feature_mask)
+        x = layer.norm1((attn_out + x_feat).reshape(B, N, C, D))
+
+        # Row attention with shared context + buffer
+        x_row = x.squeeze(2)  # [B, N, D]
+
+        H = layer.attn_rows.n_heads
+        Dh = layer.attn_rows.head_dim
+
+        q = layer.attn_rows.q_proj(x_row).view(B, N, H, Dh).transpose(1, 2)
+        k = layer.attn_rows.k_proj(x_row).view(B, N, H, Dh).transpose(1, 2)
+        v = layer.attn_rows.v_proj(x_row).view(B, N, H, Dh).transpose(1, 2)
+
+        k_ctx = layer.k_ctx_cache[:, : self.context_len, :]
+        v_ctx = layer.v_ctx_cache[:, : self.context_len, :]
+        k_buf = k[:, :, :num_targets, :]
+        v_buf = v[:, :, :num_targets, :]
+
+        attn_out = hybrid_teacher_forcing_attention(
+            q, k_ctx, v_ctx, k_buf, v_buf, num_targets, use_triton=True
+        )
 
         attn_out = attn_out.transpose(1, 2).reshape(B, N, D)
         attn_out = layer.attn_rows.out_proj(attn_out)

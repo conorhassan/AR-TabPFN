@@ -183,6 +183,166 @@ if HAS_TRITON:
         LSE_ptr_base = LSE_ptr + off_b * H + pid_h  # [B, H] layout: b * H + h
         tl.store(LSE_ptr_base, lse, mask=off_b < B)
 
+    @triton.autotune(
+        configs=[
+            triton.Config({"BLOCK_SIZE_BQ": 32, "BLOCK_SIZE_N": 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_SIZE_BQ": 64, "BLOCK_SIZE_N": 64}, num_warps=4, num_stages=2),
+            triton.Config({"BLOCK_SIZE_BQ": 32, "BLOCK_SIZE_N": 128}, num_warps=4, num_stages=3),
+            triton.Config({"BLOCK_SIZE_BQ": 64, "BLOCK_SIZE_N": 128}, num_warps=8, num_stages=3),
+            triton.Config({"BLOCK_SIZE_BQ": 128, "BLOCK_SIZE_N": 64}, num_warps=8, num_stages=2),
+        ],
+        key=["B", "H", "LQ", "N_CTX", "HEAD_DIM"],
+    )
+    @triton.jit
+    def _shared_context_attn_kernel_multiq(
+        # Pointers
+        Q_ptr,
+        K_ptr,
+        V_ptr,
+        Out_ptr,
+        LSE_ptr,  # LogSumExp output for merging
+        # Shapes
+        B,
+        H,
+        LQ,
+        N_CTX,
+        HEAD_DIM: tl.constexpr,
+        # Strides for Q [B, H, Lq, D]
+        stride_q_b,
+        stride_q_h,
+        stride_q_lq,
+        stride_q_d,
+        # Strides for K [H, N, D]
+        stride_k_h,
+        stride_k_n,
+        stride_k_d,
+        # Strides for V [H, N, D]
+        stride_v_h,
+        stride_v_n,
+        stride_v_d,
+        # Strides for Out [B, H, Lq, D]
+        stride_o_b,
+        stride_o_h,
+        stride_o_lq,
+        stride_o_d,
+        # Strides for LSE [B, H, Lq]
+        stride_lse_b,
+        stride_lse_h,
+        stride_lse_lq,
+        # Meta-parameters
+        sm_scale,
+        BLOCK_SIZE_BQ: tl.constexpr,
+        BLOCK_SIZE_N: tl.constexpr,
+    ):
+        """
+        Shared-context cross-attention kernel with LSE output for Lq > 1.
+
+        Computes: softmax(Q @ K_ctx.T / sqrt(d)) @ V_ctx
+        Returns both the attention output and LSE statistics.
+
+        The kernel parallelizes over the flattened (batch, query) dimension.
+        """
+        pid_bq = tl.program_id(0)  # Batch-query tile ID
+        pid_h = tl.program_id(1)  # Head ID
+
+        offs_bq = pid_bq * BLOCK_SIZE_BQ + tl.arange(0, BLOCK_SIZE_BQ)
+        offs_d = tl.arange(0, HEAD_DIM)
+
+        # Map flattened index -> (batch, query)
+        b_idx = offs_bq // LQ
+        q_idx = offs_bq - b_idx * LQ
+        valid_bq = b_idx < B
+
+        # Load Q tile: [BLOCK_SIZE_BQ, HEAD_DIM]
+        q_ptrs = (
+            Q_ptr
+            + b_idx[:, None] * stride_q_b
+            + pid_h * stride_q_h
+            + q_idx[:, None] * stride_q_lq
+            + offs_d[None, :] * stride_q_d
+        )
+        q = tl.load(
+            q_ptrs,
+            mask=valid_bq[:, None] & (offs_d[None, :] < HEAD_DIM),
+            other=0.0,
+        )
+        q = (q * sm_scale).to(K_ptr.dtype.element_ty)
+
+        # K/V block pointers (shared context)
+        K_block_ptr = tl.make_block_ptr(
+            base=K_ptr + pid_h * stride_k_h,
+            shape=(HEAD_DIM, N_CTX),
+            strides=(stride_k_d, stride_k_n),
+            offsets=(0, 0),
+            block_shape=(HEAD_DIM, BLOCK_SIZE_N),
+            order=(0, 1),
+        )
+        V_block_ptr = tl.make_block_ptr(
+            base=V_ptr + pid_h * stride_v_h,
+            shape=(N_CTX, HEAD_DIM),
+            strides=(stride_v_n, stride_v_d),
+            offsets=(0, 0),
+            block_shape=(BLOCK_SIZE_N, HEAD_DIM),
+            order=(1, 0),
+        )
+
+        # Online softmax accumulators
+        m_i = tl.zeros([BLOCK_SIZE_BQ], dtype=tl.float32) - float("inf")
+        l_i = tl.zeros([BLOCK_SIZE_BQ], dtype=tl.float32)
+        acc = tl.zeros([BLOCK_SIZE_BQ, HEAD_DIM], dtype=tl.float32)
+
+        for start_n in range(0, N_CTX, BLOCK_SIZE_N):
+            start_n = tl.multiple_of(start_n, BLOCK_SIZE_N)
+
+            k = tl.load(K_block_ptr, boundary_check=(0, 1))
+            v = tl.load(V_block_ptr, boundary_check=(0, 1))
+
+            qk = tl.dot(q, k)
+
+            offs_n = start_n + tl.arange(0, BLOCK_SIZE_N)
+            qk = tl.where(offs_n[None, :] < N_CTX, qk, float("-inf"))
+
+            m_i_new = tl.max(qk, 1)
+            m_i_new = tl.maximum(m_i, m_i_new)
+
+            alpha = tl.exp(m_i - m_i_new)
+            p = tl.exp(qk - m_i_new[:, None])
+
+            acc = acc * alpha[:, None]
+            acc += tl.dot(p.to(v.dtype), v)
+
+            l_i = l_i * alpha + tl.sum(p, 1)
+            m_i = m_i_new
+
+            K_block_ptr = tl.advance(K_block_ptr, (0, BLOCK_SIZE_N))
+            V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_N, 0))
+
+        acc = acc / l_i[:, None]
+        lse = m_i + tl.log(l_i)
+
+        # Store output
+        out_ptrs = (
+            Out_ptr
+            + b_idx[:, None] * stride_o_b
+            + pid_h * stride_o_h
+            + q_idx[:, None] * stride_o_lq
+            + offs_d[None, :] * stride_o_d
+        )
+        tl.store(
+            out_ptrs,
+            acc.to(Out_ptr.dtype.element_ty),
+            mask=valid_bq[:, None] & (offs_d[None, :] < HEAD_DIM),
+        )
+
+        # Store LSE
+        lse_ptrs = (
+            LSE_ptr
+            + b_idx * stride_lse_b
+            + pid_h * stride_lse_h
+            + q_idx * stride_lse_lq
+        )
+        tl.store(lse_ptrs, lse, mask=valid_bq)
+
 
 def triton_context_attention(
     q: Tensor, k_ctx: Tensor, v_ctx: Tensor, scale: Optional[float] = None
@@ -191,7 +351,7 @@ def triton_context_attention(
     Shared-context cross-attention using Triton kernel.
 
     Args:
-        q: [B, H, Lq, D] queries (Lq should be 1 for AR decode)
+        q: [B, H, Lq, D] queries
         k_ctx: [H, Nctx, D] context keys (SHARED across batch)
         v_ctx: [H, Nctx, D] context values (SHARED across batch)
         scale: Optional scaling factor (default: D^-0.5)
@@ -209,9 +369,8 @@ def triton_context_attention(
     if scale is None:
         scale = D**-0.5
 
-    # For now, we handle Lq=1 (standard AR decode)
-    # For Lq>1, we'd need to loop or extend the kernel
-    assert Lq == 1, "Currently only supports Lq=1 (single query per batch)"
+    if Lq > 1:
+        return triton_context_attention_multiq(q, k_ctx, v_ctx, scale=scale)
 
     # Squeeze Lq dimension for kernel
     q_squeezed = q.squeeze(2)  # [B, H, D]
@@ -250,6 +409,70 @@ def triton_context_attention(
 
     # Restore Lq dimension
     return out.unsqueeze(2), lse.unsqueeze(2)
+
+
+def triton_context_attention_multiq(
+    q: Tensor, k_ctx: Tensor, v_ctx: Tensor, scale: Optional[float] = None
+) -> Tuple[Tensor, Tensor]:
+    """
+    Shared-context cross-attention using Triton kernel for Lq > 1.
+
+    Args:
+        q: [B, H, Lq, D] queries
+        k_ctx: [H, Nctx, D] context keys (SHARED across batch)
+        v_ctx: [H, Nctx, D] context values (SHARED across batch)
+        scale: Optional scaling factor (default: D^-0.5)
+
+    Returns:
+        out: [B, H, Lq, D] attention output
+        lse: [B, H, Lq] LogSumExp statistics for merging with buffer attention
+    """
+    if not HAS_TRITON:
+        raise RuntimeError("Triton not available")
+
+    B, H, Lq, D = q.shape
+    N_CTX = k_ctx.shape[1]
+
+    if scale is None:
+        scale = D**-0.5
+
+    out = torch.empty((B, H, Lq, D), device=q.device, dtype=q.dtype)
+    lse = torch.empty((B, H, Lq), device=q.device, dtype=torch.float32)
+
+    grid = lambda META: (triton.cdiv(B * Lq, META["BLOCK_SIZE_BQ"]), H)
+
+    _shared_context_attn_kernel_multiq[grid](
+        q,
+        k_ctx,
+        v_ctx,
+        out,
+        lse,
+        B,
+        H,
+        Lq,
+        N_CTX,
+        D,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        k_ctx.stride(0),
+        k_ctx.stride(1),
+        k_ctx.stride(2),
+        v_ctx.stride(0),
+        v_ctx.stride(1),
+        v_ctx.stride(2),
+        out.stride(0),
+        out.stride(1),
+        out.stride(2),
+        out.stride(3),
+        lse.stride(0),
+        lse.stride(1),
+        lse.stride(2),
+        scale,
+    )
+
+    return out, lse
 
 
 def merge_attention_outputs(
@@ -377,18 +600,111 @@ def pytorch_buffer_attention(
     # Compute attention scores
     scores = torch.matmul(q, k_buf.transpose(-2, -1)) * scale  # [B, H, Lq, Nbuf]
 
+    no_kv = None
+
     # Apply mask if provided
     if mask is not None:
         scores = scores.masked_fill(~mask, float("-inf"))
+        no_kv = ~mask.any(dim=-1)
 
     # Compute LSE for merging (in float32 for numerical stability)
     lse = torch.logsumexp(scores.float(), dim=-1)  # [B, H, Lq], float32
 
     # Softmax and weighted sum
     attn = torch.softmax(scores, dim=-1)
+    if no_kv is not None:
+        attn = torch.where(no_kv.unsqueeze(-1), torch.zeros_like(attn), attn)
     out = torch.matmul(attn, v_buf)  # [B, H, Lq, D]
 
     return out, lse
+
+
+_tf_buffer_mask_cache = {}
+
+
+def _teacher_forcing_buffer_mask(num_targets: int, device: torch.device) -> Tensor:
+    """Create teacher-forcing buffer mask for [2*Nt] queries attending to [Nt] buffers."""
+    key = (num_targets, str(device))
+    cached = _tf_buffer_mask_cache.get(key)
+    if cached is not None:
+        return cached
+
+    q_idx = torch.arange(2 * num_targets, device=device)
+    kv_idx = torch.arange(num_targets, device=device)
+
+    is_buffer = q_idx < num_targets
+    buffer_mask = kv_idx[None, :] <= q_idx[:, None]
+    target_mask = kv_idx[None, :] < (q_idx - num_targets)[:, None]
+    mask = torch.where(is_buffer[:, None], buffer_mask, target_mask)
+
+    mask = mask.unsqueeze(0).unsqueeze(0)  # [1, 1, 2*Nt, Nt]
+    _tf_buffer_mask_cache[key] = mask
+    return mask
+
+
+def pytorch_teacher_forcing_buffer_attention(
+    q: Tensor,
+    k_buf: Tensor,
+    v_buf: Tensor,
+    num_targets: int,
+    scale: Optional[float] = None,
+) -> Tuple[Tensor, Tensor]:
+    """
+    Buffer attention for teacher forcing with LSE output.
+
+    Queries are ordered as [Buffer_0..Nt-1, Target_0..Nt-1].
+    Buffers attend to [0..i], targets attend to [0..i-1].
+    """
+    if q.shape[2] != 2 * num_targets:
+        raise ValueError("Expected 2*num_targets queries for teacher forcing.")
+    if k_buf.shape[2] != num_targets:
+        raise ValueError("Expected buffer length to match num_targets.")
+
+    mask = _teacher_forcing_buffer_mask(num_targets, q.device)
+    return pytorch_buffer_attention(q, k_buf, v_buf, mask=mask, scale=scale)
+
+
+def hybrid_teacher_forcing_attention(
+    q: Tensor,
+    k_ctx: Tensor,
+    v_ctx: Tensor,
+    k_buf: Tensor,
+    v_buf: Tensor,
+    num_targets: int,
+    use_triton: bool = True,
+) -> Tensor:
+    """
+    Hybrid attention for teacher forcing: Triton context + PyTorch buffer + LSE merge.
+
+    Args:
+        q: [B, H, 2*Nt, D] queries (buffers then targets)
+        k_ctx: [H, Nctx, D] context keys (SHARED)
+        v_ctx: [H, Nctx, D] context values (SHARED)
+        k_buf: [B, H, Nt, D] buffer keys (per-batch)
+        v_buf: [B, H, Nt, D] buffer values (per-batch)
+        num_targets: Nt
+        use_triton: Use Triton kernel for context (default True)
+
+    Returns:
+        out: [B, H, 2*Nt, D] combined attention output
+    """
+    if k_buf.shape[2] == 0:
+        if use_triton and HAS_TRITON and q.is_cuda:
+            out_ctx, _ = triton_context_attention(q, k_ctx, v_ctx)
+        else:
+            out_ctx, _ = pytorch_context_attention(q, k_ctx, v_ctx)
+        return out_ctx
+
+    if use_triton and HAS_TRITON and q.is_cuda:
+        out_ctx, lse_ctx = triton_context_attention(q, k_ctx, v_ctx)
+    else:
+        out_ctx, lse_ctx = pytorch_context_attention(q, k_ctx, v_ctx)
+
+    out_buf, lse_buf = pytorch_teacher_forcing_buffer_attention(
+        q, k_buf, v_buf, num_targets=num_targets
+    )
+
+    return merge_attention_outputs(out_ctx, lse_ctx, out_buf, lse_buf)
 
 
 def hybrid_attention(
