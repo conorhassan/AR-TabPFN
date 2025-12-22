@@ -1,5 +1,9 @@
 """Training loop for ARTabPFN with online tabular data generation."""
 
+import os
+os.environ["TORCHINDUCTOR_DISABLE_CUDAGRAPHS"] = "1"
+os.environ["TORCHINDUCTOR_CPP_WRAPPER"] = "0"
+
 import torch._inductor.config
 torch._inductor.config.triton.cudagraphs = False
 if hasattr(torch._inductor.config.triton, "cudagraph_trees"):
@@ -11,7 +15,6 @@ if hasattr(torch._inductor.config, "use_static_triton_launcher"):
 
 import argparse
 import math
-import os
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -322,10 +325,31 @@ def load_config(config_path: str) -> Config:
         return Config.from_dict(yaml.safe_load(f) or {})
 
 
+def print_system_info():
+    """Print system/version info for debugging."""
+    import torch
+    print("=" * 60)
+    print("System Info:")
+    print(f"  PyTorch version: {torch.__version__}")
+    print(f"  CUDA available: {torch.cuda.is_available()}")
+    if torch.cuda.is_available():
+        print(f"  CUDA version: {torch.version.cuda}")
+        print(f"  cuDNN version: {torch.backends.cudnn.version()}")
+        print(f"  GPU: {torch.cuda.get_device_name(0)}")
+        print(f"  GPU capability: {torch.cuda.get_device_capability(0)}")
+    try:
+        import triton
+        print(f"  Triton version: {triton.__version__}")
+    except ImportError:
+        print("  Triton: not installed")
+    print("=" * 60)
+
+
 def main(config: Optional[Config] = None):
     if config is None:
         config = Config()
 
+    print_system_info()
     print(f"Using device: {config.device}")
 
     dataset = OnlineTabularDataset(
