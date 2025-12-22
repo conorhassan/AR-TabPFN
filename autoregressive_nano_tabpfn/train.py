@@ -1,5 +1,8 @@
 """Training loop for ARTabPFN with online tabular data generation."""
 
+import torch._inductor.config
+torch._inductor.config.triton.cudagraphs = False
+
 import argparse
 import math
 import os
