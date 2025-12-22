@@ -2,6 +2,12 @@
 
 import torch._inductor.config
 torch._inductor.config.triton.cudagraphs = False
+if hasattr(torch._inductor.config.triton, "cudagraph_trees"):
+    torch._inductor.config.triton.cudagraph_trees = False
+if hasattr(torch._inductor.config, "use_static_cuda_launcher"):
+    torch._inductor.config.use_static_cuda_launcher = False
+if hasattr(torch._inductor.config, "use_static_triton_launcher"):
+    torch._inductor.config.use_static_triton_launcher = False
 
 import argparse
 import math
@@ -245,8 +251,9 @@ def train(model: ARTabPFN, dataset: OnlineTabularDataset, config: Config) -> ART
         else:
             mask_features, mask_rows = mask_cache[cache_key]
 
+        amp_dtype = getattr(torch, config.training.amp_dtype)
         with torch.autocast(
-            device, dtype=torch.bfloat16, enabled=config.training.use_amp and device == "cuda"
+            device, dtype=amp_dtype, enabled=config.training.use_amp and device == "cuda"
         ):
             loss = model(
                 x_context=batch.xc,
