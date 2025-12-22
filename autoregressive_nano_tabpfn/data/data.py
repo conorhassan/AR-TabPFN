@@ -17,13 +17,13 @@ class DataAttr:
     xt: Optional[torch.Tensor] = None  # [B, Nt, D] target features
     yt: Optional[torch.Tensor] = None  # [B, Nt, 1] target targets
 
-    def to(self, device):
+    def to(self, device, non_blocking=False):
         """Move all tensors to the specified device."""
         return DataAttr(
-            xc=self.xc.to(device) if self.xc is not None else None,
-            yc=self.yc.to(device) if self.yc is not None else None,
-            xb=self.xb.to(device) if self.xb is not None else None,
-            yb=self.yb.to(device) if self.yb is not None else None,
-            xt=self.xt.to(device) if self.xt is not None else None,
-            yt=self.yt.to(device) if self.yt is not None else None,
+            xc=self.xc.to(device, non_blocking=non_blocking) if self.xc is not None else None,
+            yc=self.yc.to(device, non_blocking=non_blocking) if self.yc is not None else None,
+            xb=self.xb.to(device, non_blocking=non_blocking) if self.xb is not None else None,
+            yb=self.yb.to(device, non_blocking=non_blocking) if self.yb is not None else None,
+            xt=self.xt.to(device, non_blocking=non_blocking) if self.xt is not None else None,
+            yt=self.yt.to(device, non_blocking=non_blocking) if self.yt is not None else None,
         )
