@@ -20,9 +20,10 @@ from torch.nn.attention.flex_attention import (
 )
 
 # Compile flex_attention and create_block_mask on CUDA (CPU doesn't support compiled flex_attention)
-if torch.cuda.is_available():
-    flex_attention = torch.compile(flex_attention, fullgraph=True)
-    create_block_mask = torch.compile(create_block_mask)
+# TEMPORARILY DISABLED for debugging - uncomment when Triton backward issue is resolved
+# if torch.cuda.is_available():
+#     flex_attention = torch.compile(flex_attention, fullgraph=True)
+#     create_block_mask = torch.compile(create_block_mask)
 
 
 class MultiheadAttention(nn.Module):
