@@ -231,7 +231,7 @@ def train(model: ARTabPFN, dataset: OnlineTabularDataset, config: Config) -> ART
         )
 
     if config.training.compile_model and device == "cuda":
-        model = torch.compile(model, mode="default")
+        model = torch.compile(model, mode="default", dynamic=False)
 
     optimizer = AdamW(
         model.parameters(),
