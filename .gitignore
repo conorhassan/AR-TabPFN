@@ -7,3 +7,6 @@ feature_mask.png
 row_mask.png
 autoregressive_nano_tabpfn/INFERENCE_ENGINE_PLAN.md
 ace-v1_5/
+*.md
+*.png
+!README.md
