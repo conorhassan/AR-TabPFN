@@ -14,10 +14,10 @@ data:
   seed: 123
 
 model:
-  d_model: 64
+  d_model: 128
   n_heads: 4
   n_layers: 12
-  d_ff: 128
+  d_ff: 256
   num_features: 10
   buffer_size: 32
   num_components: 20
